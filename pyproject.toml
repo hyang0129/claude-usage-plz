@@ -17,6 +17,9 @@ claude-usage = "claude_usage:main"
 Homepage = "https://github.com/hyang0129/claude-usage-plz"
 Issues = "https://github.com/hyang0129/claude-usage-plz/issues"
 
+[tool.pytest.ini_options]
+markers = ["integration: live tests requiring authenticated claude"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
