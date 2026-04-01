@@ -5,13 +5,24 @@ session via a virtual terminal (pexpect + pyte). This is the only reliable
 method — there is no public API endpoint for usage data.
 
 Usage as a library:
-    from claude_usage import get_usage
+    from claude_usage import get_usage, get_usage_multi
+
+    # Single account
     usage = get_usage()                             # default ~/.claude
     usage = get_usage("/home/me/.claude-work")      # specific profile
+
+    # Multiple accounts in parallel
+    results = get_usage_multi([
+        "/home/me/.claude-profiles/acct-a/.claude",
+        "/home/me/.claude-profiles/acct-b/.claude",
+    ])
+    for dir, usage in results.items():
+        print(f"{dir}: 5hr={usage.five_hour_pct}%")
 
 Usage as a CLI:
     claude-usage                                    # default
     claude-usage --claude-dir ~/.claude-work        # specific profile
+    claude-usage --claude-dir /path/a --claude-dir /path/b  # parallel
     claude-usage --json                             # JSON output
 """
 
@@ -24,6 +35,7 @@ import re
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from typing import Optional
 
@@ -209,6 +221,73 @@ def get_usage(claude_dir: Optional[str] = None, timeout: int = 60) -> Usage:
             pass
 
 
+def get_usage_multi(
+    claude_dirs: list[str],
+    timeout: int = 60,
+    max_workers: int | None = None,
+) -> dict[str, Usage | None]:
+    """Get usage for multiple accounts in parallel.
+
+    Each account is probed concurrently via its own pexpect/pyte session.
+    Individual failures return None without blocking other probes.
+
+    Args:
+        claude_dirs:  List of .claude config directory paths.
+        timeout:      Max seconds per probe (passed to get_usage).
+        max_workers:  Thread pool size. Defaults to min(len(claude_dirs), 4).
+
+    Returns:
+        Dict mapping each config dir to its Usage (or None on failure).
+    """
+    if not claude_dirs:
+        return {}
+
+    if max_workers is None:
+        max_workers = min(len(claude_dirs), 4)
+
+    results: dict[str, Usage | None] = {}
+
+    def _probe(claude_dir: str) -> tuple[str, Usage | None]:
+        try:
+            return claude_dir, get_usage(claude_dir=claude_dir, timeout=timeout)
+        except Exception:
+            return claude_dir, None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_probe, d): d for d in claude_dirs}
+        for future in as_completed(futures):
+            claude_dir, usage = future.result()
+            results[claude_dir] = usage
+
+    return results
+
+
+def _print_usage(usage: Usage, label: str | None = None) -> bool:
+    """Pretty-print a single Usage result. Returns True if any data shown."""
+    if label:
+        print(f"\n--- {label} ---")
+    shown = False
+    if usage.five_hour_pct is not None:
+        print(f"Session (5h):     {usage.five_hour_pct:>5.0f}% used", end="")
+        if usage.five_hour_resets:
+            print(f"  (resets {usage.five_hour_resets})", end="")
+        print()
+        shown = True
+    if usage.seven_day_pct is not None:
+        print(f"Week (all):       {usage.seven_day_pct:>5.0f}% used", end="")
+        if usage.seven_day_resets:
+            print(f"  (resets {usage.seven_day_resets})", end="")
+        print()
+        shown = True
+    if usage.sonnet_week_pct is not None:
+        print(f"Week (Sonnet):    {usage.sonnet_week_pct:>5.0f}% used", end="")
+        if usage.sonnet_week_resets:
+            print(f"  (resets {usage.sonnet_week_resets})", end="")
+        print()
+        shown = True
+    return shown
+
+
 def main():
     import argparse
 
@@ -217,7 +296,8 @@ def main():
     )
     parser.add_argument(
         "--claude-dir",
-        help="Path to .claude config directory (default: ~/.claude)",
+        action="append",
+        help="Path to .claude config directory (repeatable for multi-account)",
     )
     parser.add_argument(
         "--json", action="store_true", dest="as_json",
@@ -225,36 +305,46 @@ def main():
     )
     args = parser.parse_args()
 
+    dirs = args.claude_dir  # None or list of strings
+
     try:
-        usage = get_usage(claude_dir=args.claude_dir)
+        if dirs and len(dirs) > 1:
+            # Multi-account parallel mode
+            results = get_usage_multi(dirs)
+            if args.as_json:
+                print(json.dumps(
+                    {d: u.to_dict() if u else None for d, u in results.items()},
+                    indent=2,
+                ))
+            else:
+                any_data = False
+                for d, usage in results.items():
+                    if usage is None:
+                        print(f"\n--- {d} ---")
+                        print("  Error: failed to retrieve usage")
+                    else:
+                        if _print_usage(usage, label=d):
+                            any_data = True
+                if not any_data:
+                    print("No usage data found for any account.")
+                    sys.exit(1)
+        else:
+            # Single-account mode (default or single --claude-dir)
+            claude_dir = dirs[0] if dirs else None
+            usage = get_usage(claude_dir=claude_dir)
+
+            if args.as_json:
+                print(json.dumps(usage.to_dict(), indent=2))
+            else:
+                if not _print_usage(usage):
+                    print("No usage data found. Is Claude Code installed and logged in?")
+                    sys.exit(1)
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     except TimeoutError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
-    if args.as_json:
-        print(json.dumps(usage.to_dict(), indent=2))
-    else:
-        if usage.five_hour_pct is not None:
-            print(f"Session (5h):     {usage.five_hour_pct:>5.0f}% used", end="")
-            if usage.five_hour_resets:
-                print(f"  (resets {usage.five_hour_resets})", end="")
-            print()
-        if usage.seven_day_pct is not None:
-            print(f"Week (all):       {usage.seven_day_pct:>5.0f}% used", end="")
-            if usage.seven_day_resets:
-                print(f"  (resets {usage.seven_day_resets})", end="")
-            print()
-        if usage.sonnet_week_pct is not None:
-            print(f"Week (Sonnet):    {usage.sonnet_week_pct:>5.0f}% used", end="")
-            if usage.sonnet_week_resets:
-                print(f"  (resets {usage.sonnet_week_resets})", end="")
-            print()
-        if usage.five_hour_pct is None and usage.seven_day_pct is None:
-            print("No usage data found. Is Claude Code installed and logged in?")
-            sys.exit(1)
 
 
 if __name__ == "__main__":

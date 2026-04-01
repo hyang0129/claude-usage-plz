@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_usage import Usage, _find_claude, _parse_screen, get_usage
+from claude_usage import Usage, _find_claude, _parse_screen, get_usage, get_usage_multi
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +273,132 @@ class TestGetUsageLive:
         assert isinstance(usage, Usage)
         # Should get real data because we copied valid credentials
         assert usage.five_hour_pct is not None or usage.seven_day_pct is not None
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: get_usage_multi
+# ---------------------------------------------------------------------------
+
+
+class TestGetUsageMulti:
+    """Unit tests for get_usage_multi using mocked get_usage."""
+
+    def test_returns_dict_keyed_by_dir(self, monkeypatch):
+        fake_usage = Usage(five_hour_pct=42.0, seven_day_pct=10.0)
+        monkeypatch.setattr("claude_usage.get_usage", lambda claude_dir=None, timeout=60: fake_usage)
+
+        results = get_usage_multi(["/dir/a", "/dir/b"])
+        assert isinstance(results, dict)
+        assert set(results.keys()) == {"/dir/a", "/dir/b"}
+        for usage in results.values():
+            assert usage.five_hour_pct == 42.0
+
+    def test_individual_failure_returns_none(self, monkeypatch):
+        call_count = {"n": 0}
+
+        def flaky_get_usage(claude_dir=None, timeout=60):
+            call_count["n"] += 1
+            if call_count["n"] % 2 == 0:
+                raise TimeoutError("timed out")
+            return Usage(five_hour_pct=50.0)
+
+        monkeypatch.setattr("claude_usage.get_usage", flaky_get_usage)
+
+        results = get_usage_multi(["/dir/a", "/dir/b", "/dir/c"])
+        assert len(results) == 3
+        none_count = sum(1 for v in results.values() if v is None)
+        data_count = sum(1 for v in results.values() if v is not None)
+        # At least one should succeed and at least one should fail
+        assert none_count >= 1
+        assert data_count >= 1
+
+    def test_empty_list_returns_empty_dict(self):
+        results = get_usage_multi([])
+        assert results == {}
+
+    def test_single_dir_works(self, monkeypatch):
+        fake_usage = Usage(five_hour_pct=75.0)
+        monkeypatch.setattr("claude_usage.get_usage", lambda claude_dir=None, timeout=60: fake_usage)
+
+        results = get_usage_multi(["/only/one"])
+        assert len(results) == 1
+        assert results["/only/one"].five_hour_pct == 75.0
+
+    def test_max_workers_respected(self, monkeypatch):
+        fake_usage = Usage(five_hour_pct=10.0)
+        monkeypatch.setattr("claude_usage.get_usage", lambda claude_dir=None, timeout=60: fake_usage)
+
+        # Should not raise even with max_workers=1
+        results = get_usage_multi(["/a", "/b", "/c"], max_workers=1)
+        assert len(results) == 3
+
+    def test_all_failures_returns_all_none(self, monkeypatch):
+        def always_fail(claude_dir=None, timeout=60):
+            raise Exception("boom")
+
+        monkeypatch.setattr("claude_usage.get_usage", always_fail)
+
+        results = get_usage_multi(["/a", "/b"])
+        assert all(v is None for v in results.values())
+
+    def test_timeout_passed_through(self, monkeypatch):
+        captured = {}
+
+        def capture_timeout(claude_dir=None, timeout=60):
+            captured[claude_dir] = timeout
+            return Usage(five_hour_pct=1.0)
+
+        monkeypatch.setattr("claude_usage.get_usage", capture_timeout)
+
+        get_usage_multi(["/x", "/y"], timeout=30)
+        assert all(t == 30 for t in captured.values())
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: get_usage_multi (live)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestGetUsageMultiLive:
+    """Live integration tests for parallel usage checking."""
+
+    def test_multi_same_account(self, tmp_path):
+        """Probe the same account twice in parallel — results should agree."""
+        real_claude_dir = Path.home() / ".claude"
+        if not real_claude_dir.exists():
+            pytest.skip("~/.claude does not exist")
+
+        copy_a = tmp_path / "acct-a"
+        copy_b = tmp_path / "acct-b"
+        shutil.copytree(real_claude_dir, copy_a)
+        shutil.copytree(real_claude_dir, copy_b)
+
+        results = get_usage_multi([str(copy_a), str(copy_b)])
+        assert len(results) == 2
+
+        usages = [u for u in results.values() if u is not None]
+        assert len(usages) == 2
+
+        # Same account → 7-day should match within tolerance
+        if usages[0].seven_day_pct is not None and usages[1].seven_day_pct is not None:
+            assert abs(usages[0].seven_day_pct - usages[1].seven_day_pct) <= 2
+
+    def test_multi_with_bad_dir(self, tmp_path):
+        """One valid dir + one empty dir: valid should succeed, empty should be None."""
+        real_claude_dir = Path.home() / ".claude"
+        if not real_claude_dir.exists():
+            pytest.skip("~/.claude does not exist")
+
+        good = tmp_path / "good"
+        shutil.copytree(real_claude_dir, good)
+
+        bad = tmp_path / "bad"
+        bad.mkdir()
+
+        results = get_usage_multi([str(good), str(bad)], timeout=30)
+        assert results[str(good)] is not None
+        assert results[str(bad)] is None
 
 
 # ---------------------------------------------------------------------------
