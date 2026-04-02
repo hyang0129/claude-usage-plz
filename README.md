@@ -21,7 +21,14 @@ This tool runs `/usage` inside a virtual terminal, reads the screen, and parses 
 pip install claude-usage-plz
 ```
 
-Requires Claude Code to be installed and logged in.
+Requires Claude Code to be installed via npm and logged in:
+
+```bash
+# Install Node.js if needed, then:
+npm install -g @anthropic-ai/claude-code
+```
+
+> **Note:** On Linux, you must install Claude Code via npm (`npm install -g @anthropic-ai/claude-code`). The VS Code extension bundles its own binary, but it is not on PATH and cannot be relied upon for programmatic use.
 
 ## CLI
 

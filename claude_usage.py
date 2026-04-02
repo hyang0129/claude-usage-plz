@@ -66,10 +66,31 @@ class Usage:
 
 
 def _find_claude() -> str:
-    """Find the claude binary in PATH or VS Code extensions."""
+    """Find the claude binary via env var, PATH, or well-known locations.
+
+    Resolution order:
+    1. ``CLAUDE_BIN`` environment variable (explicit override)
+    2. ``claude`` on ``PATH`` (via :func:`shutil.which`)
+    3. Well-known install locations (pip/pipx user installs, npm global,
+       VS Code extension directories)
+    """
+    # 1. Environment variable override
+    env_bin = os.environ.get("CLAUDE_BIN")
+    if env_bin:
+        if os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+            return env_bin
+        raise FileNotFoundError(
+            f"CLAUDE_BIN is set to {env_bin!r} but it is not an executable file."
+        )
+
+    # 2. PATH lookup
     if shutil.which("claude"):
         return "claude"
+
+    # 3. Well-known locations
     for pattern in [
+        os.path.expanduser("~/.local/bin/claude"),
+        "/usr/local/bin/claude",
         os.path.expanduser("~/.vscode-server/extensions/anthropic.claude-code-*/resources/native-binary/claude"),
         os.path.expanduser("~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude"),
     ]:
@@ -77,7 +98,7 @@ def _find_claude() -> str:
         if matches:
             return matches[-1]
     raise FileNotFoundError(
-        "claude not found. Install Claude Code or add it to PATH."
+        "claude not found. Install Claude Code, add it to PATH, or set CLAUDE_BIN."
     )
 
 
@@ -120,19 +141,26 @@ def _parse_screen(text: str) -> Usage:
     return usage
 
 
-def get_usage(claude_dir: Optional[str] = None, timeout: int = 60) -> Usage:
+def get_usage(
+    claude_dir: Optional[str] = None,
+    claude_bin: Optional[str] = None,
+    timeout: int = 60,
+) -> Usage:
     """Get current Claude usage by running /usage in a virtual terminal.
 
     Args:
         claude_dir: Path to the .claude config directory. Defaults to
                     ~/.claude (the standard location). Pass a different
                     path to check a specific profile/account.
+        claude_bin: Explicit path to the ``claude`` binary. When provided,
+                    auto-discovery via :func:`_find_claude` is skipped.
         timeout:    Max seconds to wait for claude to start and respond.
 
     Returns:
         A Usage dataclass with the parsed percentages and reset times.
     """
-    claude_bin = _find_claude()
+    if claude_bin is None:
+        claude_bin = _find_claude()
 
     env = os.environ.copy()
     if claude_dir:
@@ -170,13 +198,7 @@ def get_usage(claude_dir: Optional[str] = None, timeout: int = 60) -> Usage:
             feed()
             t = text()
 
-            # Check if we're already at the prompt (no bypass dialog)
-            if not accepted and not at_prompt:
-                if "\u276f" in t or "\u2771" in t or "bypass permissions" in t.lower():
-                    at_prompt = True
-                    break
-
-            # Handle bypass-permissions prompt if it appears
+            # Handle bypass-permissions prompt if it appears (must check BEFORE prompt detection)
             if ("Yes, I accept" in t or "No, exit" in t) and not accepted:
                 child.send("\x1b[B")  # down arrow
                 time.sleep(0.3)
@@ -185,8 +207,9 @@ def get_usage(claude_dir: Optional[str] = None, timeout: int = 60) -> Usage:
                 time.sleep(3)
                 continue
 
-            if accepted and not at_prompt:
-                if "\u276f" in t or "bypass permissions" in t.lower():
+            # Check if we're at the input prompt (not the bypass dialog)
+            if not at_prompt:
+                if "\u276f" in t or "\u2771" in t:
                     at_prompt = True
                     break
 
@@ -236,6 +259,7 @@ def get_usage(claude_dir: Optional[str] = None, timeout: int = 60) -> Usage:
 
 def get_usage_multi(
     claude_dirs: list[str],
+    claude_bin: Optional[str] = None,
     timeout: int = 60,
     max_workers: int | None = None,
 ) -> dict[str, Usage | None]:
@@ -246,6 +270,8 @@ def get_usage_multi(
 
     Args:
         claude_dirs:  List of .claude config directory paths.
+        claude_bin:   Explicit path to the ``claude`` binary. Passed through
+                      to each :func:`get_usage` call, bypassing auto-discovery.
         timeout:      Max seconds per probe (passed to get_usage).
         max_workers:  Thread pool size. Defaults to min(len(claude_dirs), 4).
 
@@ -262,7 +288,7 @@ def get_usage_multi(
 
     def _probe(claude_dir: str) -> tuple[str, Usage | None]:
         try:
-            return claude_dir, get_usage(claude_dir=claude_dir, timeout=timeout)
+            return claude_dir, get_usage(claude_dir=claude_dir, claude_bin=claude_bin, timeout=timeout)
         except Exception as e:
             logger.warning("Probe failed for %s: %s: %s", claude_dir, type(e).__name__, e)
             return claude_dir, None
@@ -314,6 +340,10 @@ def main():
         help="Path to .claude config directory (repeatable for multi-account)",
     )
     parser.add_argument(
+        "--claude-bin",
+        help="Explicit path to the claude binary (skips auto-discovery)",
+    )
+    parser.add_argument(
         "--json", action="store_true", dest="as_json",
         help="Output as JSON",
     )
@@ -329,11 +359,12 @@ def main():
     )
 
     dirs = args.claude_dir  # None or list of strings
+    bin_path = args.claude_bin
 
     try:
         if dirs and len(dirs) > 1:
             # Multi-account parallel mode
-            results = get_usage_multi(dirs)
+            results = get_usage_multi(dirs, claude_bin=bin_path)
             if args.as_json:
                 print(json.dumps(
                     {d: u.to_dict() if u else None for d, u in results.items()},
@@ -354,7 +385,7 @@ def main():
         else:
             # Single-account mode (default or single --claude-dir)
             claude_dir = dirs[0] if dirs else None
-            usage = get_usage(claude_dir=claude_dir)
+            usage = get_usage(claude_dir=claude_dir, claude_bin=bin_path)
 
             if args.as_json:
                 print(json.dumps(usage.to_dict(), indent=2))

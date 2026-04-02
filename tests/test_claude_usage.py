@@ -14,6 +14,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import pexpect
 import pytest
 
 from claude_usage import Usage, _find_claude, _parse_screen, get_usage, get_usage_multi
@@ -204,6 +205,29 @@ class TestFindClaude:
     def test_find_claude_returns_string(self):
         assert isinstance(_find_claude(), str)
 
+    def test_claude_bin_env_var(self, tmp_path, monkeypatch):
+        """CLAUDE_BIN env var should be used when set to a valid executable."""
+        fake_bin = tmp_path / "my-claude"
+        fake_bin.write_text("#!/bin/sh\n")
+        fake_bin.chmod(0o755)
+        monkeypatch.setenv("CLAUDE_BIN", str(fake_bin))
+        assert _find_claude() == str(fake_bin)
+
+    def test_claude_bin_env_var_missing_file(self, monkeypatch):
+        """CLAUDE_BIN pointing to a non-existent file should raise."""
+        monkeypatch.setenv("CLAUDE_BIN", "/nonexistent/claude")
+        with pytest.raises(FileNotFoundError, match="CLAUDE_BIN"):
+            _find_claude()
+
+    def test_claude_bin_env_var_not_executable(self, tmp_path, monkeypatch):
+        """CLAUDE_BIN pointing to a non-executable file should raise."""
+        not_exec = tmp_path / "not-executable"
+        not_exec.write_text("data")
+        not_exec.chmod(0o644)
+        monkeypatch.setenv("CLAUDE_BIN", str(not_exec))
+        with pytest.raises(FileNotFoundError, match="CLAUDE_BIN"):
+            _find_claude()
+
 
 # ---------------------------------------------------------------------------
 # Integration tests: get_usage (live, requires authenticated .claude)
@@ -318,12 +342,80 @@ class TestGetUsageLive:
 # ---------------------------------------------------------------------------
 
 
+class TestGetUsageClaudeBin:
+    """Tests for the claude_bin parameter on get_usage / get_usage_multi."""
+
+    def test_get_usage_skips_find_when_claude_bin_given(self, monkeypatch):
+        """When claude_bin is passed, _find_claude should not be called."""
+        find_called = {"called": False}
+        orig_find = _find_claude
+
+        def spy_find():
+            find_called["called"] = True
+            return orig_find()
+
+        monkeypatch.setattr("claude_usage._find_claude", spy_find)
+
+        # Mock pexpect.spawn so we don't actually launch a process
+        import claude_usage
+
+        class FakeChild:
+            def read_nonblocking(self, size=4096, timeout=1):
+                raise pexpect.TIMEOUT("")
+
+            def send(self, s):
+                pass
+
+            def sendline(self, s):
+                pass
+
+            def close(self, force=False):
+                pass
+
+        monkeypatch.setattr(pexpect, "spawn", lambda *a, **kw: FakeChild())
+
+        # We expect a TimeoutError because FakeChild never produces output,
+        # but _find_claude should NOT have been called.
+        try:
+            get_usage(claude_bin="/usr/bin/fake-claude", timeout=2)
+        except (TimeoutError, Exception):
+            pass
+
+        assert not find_called["called"], "_find_claude was called despite claude_bin being provided"
+
+    def test_get_usage_multi_passes_claude_bin(self, monkeypatch):
+        """claude_bin should be forwarded to each get_usage call."""
+        captured_bins = []
+
+        def capture_get_usage(claude_dir=None, claude_bin=None, timeout=60):
+            captured_bins.append(claude_bin)
+            return Usage(five_hour_pct=10.0)
+
+        monkeypatch.setattr("claude_usage.get_usage", capture_get_usage)
+
+        get_usage_multi(["/a", "/b"], claude_bin="/custom/claude")
+        assert all(b == "/custom/claude" for b in captured_bins)
+
+    def test_get_usage_multi_none_claude_bin_by_default(self, monkeypatch):
+        """Without claude_bin, get_usage should receive None."""
+        captured_bins = []
+
+        def capture_get_usage(claude_dir=None, claude_bin=None, timeout=60):
+            captured_bins.append(claude_bin)
+            return Usage(five_hour_pct=10.0)
+
+        monkeypatch.setattr("claude_usage.get_usage", capture_get_usage)
+
+        get_usage_multi(["/a"])
+        assert captured_bins == [None]
+
+
 class TestGetUsageMulti:
     """Unit tests for get_usage_multi using mocked get_usage."""
 
     def test_returns_dict_keyed_by_dir(self, monkeypatch):
         fake_usage = Usage(five_hour_pct=42.0, seven_day_pct=10.0)
-        monkeypatch.setattr("claude_usage.get_usage", lambda claude_dir=None, timeout=60: fake_usage)
+        monkeypatch.setattr("claude_usage.get_usage", lambda claude_dir=None, claude_bin=None, timeout=60: fake_usage)
 
         results = get_usage_multi(["/dir/a", "/dir/b"])
         assert isinstance(results, dict)
@@ -334,7 +426,7 @@ class TestGetUsageMulti:
     def test_individual_failure_returns_none(self, monkeypatch):
         call_count = {"n": 0}
 
-        def flaky_get_usage(claude_dir=None, timeout=60):
+        def flaky_get_usage(claude_dir=None, claude_bin=None, timeout=60):
             call_count["n"] += 1
             if call_count["n"] % 2 == 0:
                 raise TimeoutError("timed out")
@@ -356,7 +448,7 @@ class TestGetUsageMulti:
 
     def test_single_dir_works(self, monkeypatch):
         fake_usage = Usage(five_hour_pct=75.0)
-        monkeypatch.setattr("claude_usage.get_usage", lambda claude_dir=None, timeout=60: fake_usage)
+        monkeypatch.setattr("claude_usage.get_usage", lambda claude_dir=None, claude_bin=None, timeout=60: fake_usage)
 
         results = get_usage_multi(["/only/one"])
         assert len(results) == 1
@@ -364,14 +456,14 @@ class TestGetUsageMulti:
 
     def test_max_workers_respected(self, monkeypatch):
         fake_usage = Usage(five_hour_pct=10.0)
-        monkeypatch.setattr("claude_usage.get_usage", lambda claude_dir=None, timeout=60: fake_usage)
+        monkeypatch.setattr("claude_usage.get_usage", lambda claude_dir=None, claude_bin=None, timeout=60: fake_usage)
 
         # Should not raise even with max_workers=1
         results = get_usage_multi(["/a", "/b", "/c"], max_workers=1)
         assert len(results) == 3
 
     def test_all_failures_returns_all_none(self, monkeypatch):
-        def always_fail(claude_dir=None, timeout=60):
+        def always_fail(claude_dir=None, claude_bin=None, timeout=60):
             raise Exception("boom")
 
         monkeypatch.setattr("claude_usage.get_usage", always_fail)
@@ -383,7 +475,7 @@ class TestGetUsageMulti:
         """Failed probes should log a warning with the exception details."""
         import logging
 
-        def always_fail(claude_dir=None, timeout=60):
+        def always_fail(claude_dir=None, claude_bin=None, timeout=60):
             raise TimeoutError("timed out waiting for claude prompt")
 
         monkeypatch.setattr("claude_usage.get_usage", always_fail)
@@ -398,7 +490,7 @@ class TestGetUsageMulti:
     def test_timeout_passed_through(self, monkeypatch):
         captured = {}
 
-        def capture_timeout(claude_dir=None, timeout=60):
+        def capture_timeout(claude_dir=None, claude_bin=None, timeout=60):
             captured[claude_dir] = timeout
             return Usage(five_hour_pct=1.0)
 
