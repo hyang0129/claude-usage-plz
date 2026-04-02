@@ -39,8 +39,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from typing import Optional
 
+import logging
+
 import pexpect
 import pyte
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,9 +55,14 @@ class Usage:
     seven_day_resets: Optional[str] = None
     sonnet_week_pct: Optional[float] = None
     sonnet_week_resets: Optional[str] = None
+    raw_output: Optional[str] = None
+    error: Optional[str] = None
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def to_dict(self, include_raw: bool = False) -> dict:
+        d = asdict(self)
+        if not include_raw:
+            d.pop("raw_output", None)
+        return d
 
 
 def _find_claude() -> str:
@@ -74,7 +83,7 @@ def _find_claude() -> str:
 
 def _parse_screen(text: str) -> Usage:
     """Extract usage percentages from the /usage screen output."""
-    usage = Usage()
+    usage = Usage(raw_output=text)
     lines = text.split("\n")
 
     for i, line in enumerate(lines):
@@ -103,6 +112,10 @@ def _parse_screen(text: str) -> Usage:
         elif "week" in ctx and usage.seven_day_pct is None:
             usage.seven_day_pct = pct
             usage.seven_day_resets = resets
+
+    if usage.five_hour_pct is None and usage.seven_day_pct is None and usage.sonnet_week_pct is None:
+        logger.warning("No usage data parsed from screen output (%d lines)", len(lines))
+        logger.debug("Raw screen output:\n%s", text)
 
     return usage
 
@@ -250,7 +263,8 @@ def get_usage_multi(
     def _probe(claude_dir: str) -> tuple[str, Usage | None]:
         try:
             return claude_dir, get_usage(claude_dir=claude_dir, timeout=timeout)
-        except Exception:
+        except Exception as e:
+            logger.warning("Probe failed for %s: %s: %s", claude_dir, type(e).__name__, e)
             return claude_dir, None
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -303,7 +317,16 @@ def main():
         "--json", action="store_true", dest="as_json",
         help="Output as JSON",
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable debug logging (shows raw screen output on failure)",
+    )
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(name)s %(levelname)s: %(message)s",
+    )
 
     dirs = args.claude_dir  # None or list of strings
 
@@ -321,7 +344,7 @@ def main():
                 for d, usage in results.items():
                     if usage is None:
                         print(f"\n--- {d} ---")
-                        print("  Error: failed to retrieve usage")
+                        print("  Error: failed to retrieve usage (use -v for details)")
                     else:
                         if _print_usage(usage, label=d):
                             any_data = True
@@ -338,6 +361,10 @@ def main():
             else:
                 if not _print_usage(usage):
                     print("No usage data found. Is Claude Code installed and logged in?")
+                    if args.verbose and usage.raw_output:
+                        print(f"\nRaw screen output:\n{usage.raw_output}")
+                    elif not args.verbose:
+                        print("Run with -v for debug output.")
                     sys.exit(1)
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)

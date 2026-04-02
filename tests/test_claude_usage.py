@@ -127,6 +127,23 @@ class TestParseScreen:
         usage = _parse_screen(screen)
         assert usage.five_hour_pct == 100.0
 
+    def test_parse_stores_raw_output(self):
+        """_parse_screen should store the original text in raw_output."""
+        usage = _parse_screen(self.CLEAN_SCREEN)
+        assert usage.raw_output is not None
+        assert "58% used" in usage.raw_output
+
+    def test_parse_empty_stores_raw_output(self):
+        """Even empty input should be stored in raw_output."""
+        usage = _parse_screen("")
+        assert usage.raw_output == ""
+
+    def test_parse_no_match_stores_raw_output(self):
+        """Non-matching text should still be preserved in raw_output."""
+        text = "Some random text\nwith no percentages"
+        usage = _parse_screen(text)
+        assert usage.raw_output == text
+
 
 # ---------------------------------------------------------------------------
 # Unit tests: Usage dataclass
@@ -148,8 +165,29 @@ class TestUsage:
 
     def test_defaults_are_none(self):
         usage = Usage()
-        for v in usage.to_dict().values():
-            assert v is None
+        d = usage.to_dict()
+        assert d["five_hour_pct"] is None
+        assert d["seven_day_pct"] is None
+        assert d["sonnet_week_pct"] is None
+        assert d["error"] is None
+
+    def test_to_dict_excludes_raw_by_default(self):
+        usage = Usage(five_hour_pct=50.0, raw_output="some raw text")
+        d = usage.to_dict()
+        assert "raw_output" not in d
+
+    def test_to_dict_includes_raw_when_requested(self):
+        usage = Usage(five_hour_pct=50.0, raw_output="some raw text")
+        d = usage.to_dict(include_raw=True)
+        assert d["raw_output"] == "some raw text"
+
+    def test_error_field_default_none(self):
+        usage = Usage()
+        assert usage.error is None
+
+    def test_error_field_stored(self):
+        usage = Usage(error="TimeoutError: timed out")
+        assert usage.error == "TimeoutError: timed out"
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +379,22 @@ class TestGetUsageMulti:
         results = get_usage_multi(["/a", "/b"])
         assert all(v is None for v in results.values())
 
+    def test_failure_logs_warning(self, monkeypatch, caplog):
+        """Failed probes should log a warning with the exception details."""
+        import logging
+
+        def always_fail(claude_dir=None, timeout=60):
+            raise TimeoutError("timed out waiting for claude prompt")
+
+        monkeypatch.setattr("claude_usage.get_usage", always_fail)
+
+        with caplog.at_level(logging.WARNING, logger="claude_usage"):
+            results = get_usage_multi(["/a"])
+
+        assert results["/a"] is None
+        assert any("TimeoutError" in r.message for r in caplog.records)
+        assert any("/a" in r.message for r in caplog.records)
+
     def test_timeout_passed_through(self, monkeypatch):
         captured = {}
 
@@ -399,6 +453,34 @@ class TestGetUsageMultiLive:
         results = get_usage_multi([str(good), str(bad)], timeout=30)
         assert results[str(good)] is not None
         assert results[str(bad)] is None
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: logging behavior
+# ---------------------------------------------------------------------------
+
+
+class TestLogging:
+    """Test that appropriate log messages are emitted."""
+
+    def test_parse_screen_warns_on_no_data(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="claude_usage"):
+            _parse_screen("no usage data here")
+        assert any("No usage data parsed" in r.message for r in caplog.records)
+
+    def test_parse_screen_no_warning_on_valid_data(self, caplog):
+        import logging
+
+        screen = """
+  Current session
+  ██████████                        25% used
+  Resets 3am (UTC)
+"""
+        with caplog.at_level(logging.WARNING, logger="claude_usage"):
+            _parse_screen(screen)
+        assert not any("No usage data parsed" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
