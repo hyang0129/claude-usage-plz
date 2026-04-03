@@ -198,13 +198,23 @@ def get_usage(
             feed()
             t = text()
 
+            # Handle workspace trust prompt ("Yes, I trust this folder")
+            if "I trust this folder" in t and "No, exit" in t:
+                logger.debug("Detected workspace trust prompt, accepting")
+                child.send("\r")  # first option is already selected: "Yes, I trust this folder"
+                time.sleep(2)
+                screen.reset()
+                continue
+
             # Handle bypass-permissions prompt if it appears (must check BEFORE prompt detection)
-            if ("Yes, I accept" in t or "No, exit" in t) and not accepted:
-                child.send("\x1b[B")  # down arrow
+            if ("Yes, I accept" in t or "Bypass Permissions" in t) and not accepted:
+                logger.debug("Detected bypass-permissions prompt, accepting")
+                child.send("\x1b[B")  # down arrow to "Yes, I accept"
                 time.sleep(0.3)
                 child.send("\r")
                 accepted = True
                 time.sleep(3)
+                screen.reset()
                 continue
 
             # Check if we're at the input prompt (not the bypass dialog)
