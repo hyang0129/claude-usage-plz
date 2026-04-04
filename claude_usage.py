@@ -40,11 +40,39 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 
 import logging
+import logging.handlers
 
 import pexpect
 import pyte
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_TIMEOUT = 30
+
+_file_logger: logging.Logger | None = None
+
+
+def _setup_file_logger(claude_dir: str | None) -> None:
+    """Set up a rotating file logger inside claude_dir. Called once per get_usage()."""
+    global _file_logger
+    log_dir = claude_dir if claude_dir else os.path.expanduser("~/.claude")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "claude-usage.log")
+    handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=1_000_000, backupCount=3
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    fl = logging.getLogger(f"claude_usage._file.{log_path}")
+    fl.setLevel(logging.DEBUG)
+    fl.handlers = [handler]
+    fl.propagate = False
+    _file_logger = fl
+
+
+def _log(msg: str) -> None:
+    logger.debug(msg)
+    if _file_logger:
+        _file_logger.debug(msg)
 
 
 @dataclass
@@ -141,10 +169,15 @@ def _parse_screen(text: str) -> Usage:
     return usage
 
 
+def _is_login_screen(t: str) -> bool:
+    """Return True if the screen is showing the claude login/auth prompt."""
+    return "Select login method" in t or "Claude account with subscription" in t
+
+
 def get_usage(
     claude_dir: Optional[str] = None,
     claude_bin: Optional[str] = None,
-    timeout: int = 60,
+    timeout: int = DEFAULT_TIMEOUT,
 ) -> Usage:
     """Get current Claude usage by running /usage in a virtual terminal.
 
@@ -159,8 +192,13 @@ def get_usage(
     Returns:
         A Usage dataclass with the parsed percentages and reset times.
     """
+    _setup_file_logger(claude_dir)
+
     if claude_bin is None:
         claude_bin = _find_claude()
+
+    _log(f"using claude binary: {claude_bin}")
+    _log(f"claude_dir={claude_dir!r}, timeout={timeout}s")
 
     env = os.environ.copy()
     if claude_dir:
@@ -169,6 +207,7 @@ def get_usage(
     screen = pyte.Screen(120, 40)
     stream = pyte.Stream(screen)
 
+    _log("spawning claude process...")
     child = pexpect.spawn(
         claude_bin,
         args=["--dangerously-skip-permissions"],
@@ -177,6 +216,7 @@ def get_usage(
         dimensions=(40, 120),
         env=env,
     )
+    _log(f"spawned pid={child.pid}")
 
     def feed():
         try:
@@ -193,45 +233,68 @@ def get_usage(
         deadline = time.time() + timeout
         accepted = False
         at_prompt = False
+        last_screen_log = 0
 
+        _log("waiting for claude to be ready...")
         while time.time() < deadline:
             feed()
             t = text()
+            elapsed = time.time() - (deadline - timeout)
 
-            # Handle workspace trust prompt ("Yes, I trust this folder")
-            if "I trust this folder" in t and "No, exit" in t:
-                logger.debug("Detected workspace trust prompt, accepting")
+            # Log screen state every 5s
+            if time.time() - last_screen_log >= 5:
+                visible = [l for l in t.split("\n") if l.strip()]
+                _log(f"t={elapsed:.1f}s screen ({len(visible)} lines):")
+                for line in visible[:10]:
+                    _log(f"  | {line}")
+                last_screen_log = time.time()
+
+            # 1. Bail out early if claude is showing the login/auth screen
+            if _is_login_screen(t):
+                raise PermissionError(
+                    "Not authenticated: claude is prompting for login. "
+                    "Run `claude` interactively to log in first."
+                )
+
+            # 2. Handle workspace trust prompt ("Yes, I trust this folder")
+            if "Yes, I trust this folder" in t and not accepted:
+                _log(f"t={elapsed:.1f}s: trust-folder dialog detected, accepting...")
                 child.send("\r")  # first option is already selected: "Yes, I trust this folder"
+                accepted = True
                 time.sleep(2)
-                screen.reset()
                 continue
 
-            # Handle bypass-permissions prompt if it appears (must check BEFORE prompt detection)
+            # 3. Handle bypass-permissions prompt if it appears (must check BEFORE prompt detection)
             if ("Yes, I accept" in t or "Bypass Permissions" in t) and not accepted:
-                logger.debug("Detected bypass-permissions prompt, accepting")
+                _log(f"t={elapsed:.1f}s: bypass-permissions dialog detected, accepting...")
                 child.send("\x1b[B")  # down arrow to "Yes, I accept"
                 time.sleep(0.3)
                 child.send("\r")
                 accepted = True
                 time.sleep(3)
-                screen.reset()
                 continue
 
-            # Check if we're at the input prompt (not the bypass dialog)
-            if not at_prompt:
-                if "\u276f" in t or "\u2771" in t:
-                    at_prompt = True
-                    break
+            # 4. Check if we're at the welcome splash (reliable signal that claude is ready)
+            if "Welcome back" in t or "Tips for getting started" in t:
+                _log(f"t={elapsed:.1f}s: welcome splash detected — claude is ready, proceeding")
+                at_prompt = True
+                break
 
             time.sleep(0.5)
 
         if not at_prompt:
+            t = text()
+            visible = [l for l in t.split("\n") if l.strip()]
+            _log(f"TIMEOUT waiting for claude ready state. Final screen ({len(visible)} lines):")
+            for line in visible:
+                _log(f"  | {line}")
             raise TimeoutError("Timed out waiting for claude prompt")
 
         feed()
+        elapsed = time.time() - (deadline - timeout)
+        _log(f"t={elapsed:.1f}s: at prompt, sending /usage...")
 
         # Send /usage
-        screen.reset()
         for ch in "/usage":
             child.send(ch)
             time.sleep(0.05)
@@ -240,17 +303,35 @@ def get_usage(
         child.send("\r")
 
         # Wait for results
-        for _ in range(timeout):
+        _log("waiting for /usage output...")
+        for i in range(timeout):
             time.sleep(1)
             feed()
             t = text()
+            visible = [l for l in t.split("\n") if l.strip()]
+            _log(f"  wait {i+1}s: {len(visible)} non-empty lines, has_pct={'%' in t and 'used' in t}")
+            if visible:
+                for line in visible[:5]:
+                    _log(f"    | {line}")
+            if _is_login_screen(t):
+                raise PermissionError(
+                    "Not authenticated: claude is prompting for login. "
+                    "Run `claude` interactively to log in first."
+                )
             if "%" in t and "used" in t:
                 # Give it a moment to finish rendering
                 time.sleep(1)
                 feed()
                 break
+        else:
+            t = text()
+            visible = [l for l in t.split("\n") if l.strip()]
+            _log(f"TIMEOUT waiting for /usage output. Final screen ({len(visible)} lines):")
+            for line in visible:
+                _log(f"  | {line}")
 
         result = _parse_screen(text())
+        _log(f"parsed: {result}")
 
         # Exit
         child.send("\x1b")
@@ -270,7 +351,7 @@ def get_usage(
 def get_usage_multi(
     claude_dirs: list[str],
     claude_bin: Optional[str] = None,
-    timeout: int = 60,
+    timeout: int = DEFAULT_TIMEOUT,
     max_workers: int | None = None,
 ) -> dict[str, Usage | None]:
     """Get usage for multiple accounts in parallel.
@@ -361,6 +442,10 @@ def main():
         "-v", "--verbose", action="store_true",
         help="Enable debug logging (shows raw screen output on failure)",
     )
+    parser.add_argument(
+        "--timeout", type=int, default=DEFAULT_TIMEOUT,
+        help=f"Timeout in seconds (default: {DEFAULT_TIMEOUT})",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -374,7 +459,7 @@ def main():
     try:
         if dirs and len(dirs) > 1:
             # Multi-account parallel mode
-            results = get_usage_multi(dirs, claude_bin=bin_path)
+            results = get_usage_multi(dirs, claude_bin=bin_path, timeout=args.timeout)
             if args.as_json:
                 print(json.dumps(
                     {d: u.to_dict() if u else None for d, u in results.items()},
@@ -395,7 +480,7 @@ def main():
         else:
             # Single-account mode (default or single --claude-dir)
             claude_dir = dirs[0] if dirs else None
-            usage = get_usage(claude_dir=claude_dir, claude_bin=bin_path)
+            usage = get_usage(claude_dir=claude_dir, claude_bin=bin_path, timeout=args.timeout)
 
             if args.as_json:
                 print(json.dumps(usage.to_dict(), indent=2))
@@ -413,6 +498,9 @@ def main():
     except TimeoutError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    except PermissionError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
